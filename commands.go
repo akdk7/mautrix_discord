@@ -886,12 +886,28 @@ func fnResetAvatars(ce *WrappedCommandEvent) {
 	target := strings.ToLower(ce.Args[0])
 	switch target {
 	case "group", "portal", "room":
-		if ce.Portal == nil {
-			ce.Reply("This is not a portal room.")
-			return
-		}
 		if remaining, ok := shouldRateLimitResetAvatars(string(ce.User.MXID)); ok {
 			ce.Reply("This command is rate limited. Try again in %s.", formatCooldown(remaining))
+			return
+		}
+		if ce.Portal == nil {
+			guild := ce.Bridge.GetGuildByMXID(ce.RoomID)
+			if guild == nil {
+				ce.Reply("This is not a portal room.")
+				return
+			}
+			resetGuildAvatar(guild)
+			meta, err := ce.User.Session.Guild(guild.ID)
+			if err != nil {
+				ce.Reply("Failed to get guild info from Discord: %v", err)
+				return
+			}
+			if meta == nil {
+				ce.Reply("Failed to get guild info from Discord.")
+				return
+			}
+			guild.UpdateInfo(ce.User, meta)
+			ce.Reply("Avatar reset complete.")
 			return
 		}
 		switch ce.Portal.Type {
@@ -1008,6 +1024,12 @@ func fnResetAvatars(ce *WrappedCommandEvent) {
 		}
 		withAvatarsOnly := target == "contacts-with-avatars"
 		contactIDs := make(map[string]struct{})
+		for _, puppet := range ce.Bridge.GetAllPuppets() {
+			if puppet == nil || puppet.ID == "" {
+				continue
+			}
+			contactIDs[puppet.ID] = struct{}{}
+		}
 		for userID := range ce.User.relationships {
 			contactIDs[userID] = struct{}{}
 		}
