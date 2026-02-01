@@ -906,7 +906,11 @@ func fnResetAvatars(ce *WrappedCommandEvent) {
 				ce.Reply("Failed to get guild info from Discord.")
 				return
 			}
-			guild.UpdateInfo(ce.User, meta)
+			changed := guild.UpdateAvatar(meta.Icon)
+			if changed {
+				guild.UpdateBridgeInfo()
+				guild.Update()
+			}
 			ce.Reply("Avatar reset complete.")
 			return
 		}
@@ -969,7 +973,11 @@ func fnResetAvatars(ce *WrappedCommandEvent) {
 					ce.Reply("Failed to get guild info from Discord.")
 					return
 				}
-				ce.Portal.Guild.UpdateInfo(ce.User, meta)
+				changed := ce.Portal.Guild.UpdateAvatar(meta.Icon)
+				if changed {
+					ce.Portal.Guild.UpdateBridgeInfo()
+					ce.Portal.Guild.Update()
+				}
 				ce.Reply("Avatar reset complete.")
 			} else {
 				resetPortalAvatar(ce.Portal)
@@ -999,7 +1007,11 @@ func fnResetAvatars(ce *WrappedCommandEvent) {
 				}
 				meta, _ := ce.User.Session.Guild(guild.ID)
 				if meta != nil {
-					guild.UpdateInfo(ce.User, meta)
+					changed := guild.UpdateAvatar(meta.Icon)
+					if changed {
+						guild.UpdateBridgeInfo()
+						guild.Update()
+					}
 				}
 			case database.UserPortalTypeDM:
 				meta, _ := ce.User.Session.Channel(portal.DiscordID)
@@ -1072,6 +1084,15 @@ func fnResetAvatars(ce *WrappedCommandEvent) {
 				continue
 			}
 			puppet.UpdateInfo(ce.User, info, nil)
+			for _, dmPortal := range ce.Bridge.GetDMPortalsWith(userID) {
+				if dmPortal == nil || dmPortal.MXID == "" {
+					continue
+				}
+				if dmPortal.UpdateAvatarFromPuppet(puppet) {
+					dmPortal.Update()
+					dmPortal.UpdateBridgeInfo()
+				}
+			}
 		}
 		ce.Reply("Reset avatars for %d contacts.", resetCount)
 	default:
