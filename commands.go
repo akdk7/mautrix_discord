@@ -906,11 +906,9 @@ func fnResetAvatars(ce *WrappedCommandEvent) {
 				ce.Reply("Failed to get guild info from Discord.")
 				return
 			}
-			changed := guild.UpdateAvatar(meta.Icon)
-			if changed {
-				guild.UpdateBridgeInfo()
-				guild.Update()
-			}
+			guild.UpdateAvatar(meta.Icon)
+			guild.UpdateBridgeInfo()
+			guild.Update()
 			ce.Reply("Avatar reset complete.")
 			return
 		}
@@ -973,11 +971,9 @@ func fnResetAvatars(ce *WrappedCommandEvent) {
 					ce.Reply("Failed to get guild info from Discord.")
 					return
 				}
-				changed := ce.Portal.Guild.UpdateAvatar(meta.Icon)
-				if changed {
-					ce.Portal.Guild.UpdateBridgeInfo()
-					ce.Portal.Guild.Update()
-				}
+				ce.Portal.Guild.UpdateAvatar(meta.Icon)
+				ce.Portal.Guild.UpdateBridgeInfo()
+				ce.Portal.Guild.Update()
 				ce.Reply("Avatar reset complete.")
 			} else {
 				resetPortalAvatar(ce.Portal)
@@ -1007,11 +1003,9 @@ func fnResetAvatars(ce *WrappedCommandEvent) {
 				}
 				meta, _ := ce.User.Session.Guild(guild.ID)
 				if meta != nil {
-					changed := guild.UpdateAvatar(meta.Icon)
-					if changed {
-						guild.UpdateBridgeInfo()
-						guild.Update()
-					}
+					guild.UpdateAvatar(meta.Icon)
+					guild.UpdateBridgeInfo()
+					guild.Update()
 				}
 			case database.UserPortalTypeDM:
 				meta, _ := ce.User.Session.Channel(portal.DiscordID)
