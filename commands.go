@@ -23,9 +23,12 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/skip2/go-qrcode"
@@ -67,6 +70,7 @@ func (br *DiscordBridge) RegisterCommands() {
 		cmdUnsetRelay,
 		cmdGuilds,
 		cmdRejoinSpace,
+		cmdResetAvatars,
 		cmdDeleteAllPortals,
 		cmdExec,
 		cmdCommands,
@@ -96,6 +100,23 @@ var cmdLoginToken = &commands.FullHandler{
 }
 
 const discordTokenEpoch = 1293840000
+
+const (
+	resetAvatarsBurst          = 3
+	resetAvatarsRefillInterval = 10 * time.Minute
+)
+
+type resetAvatarsBucket struct {
+	tokens float64
+	last   time.Time
+}
+
+var resetAvatarsLimiter = struct {
+	sync.Mutex
+	buckets map[string]resetAvatarsBucket
+}{
+	buckets: make(map[string]resetAvatarsBucket),
+}
 
 func decodeToken(token string) (userID int64, err error) {
 	parts := strings.Split(token, ".")
@@ -843,6 +864,280 @@ func fnUnbridge(ce *WrappedCommandEvent) {
 	ce.Portal.removeFromSpace()
 	ce.Portal.cleanup(ce.Command == "unbridge")
 	ce.Portal.RemoveMXID()
+}
+
+var cmdResetAvatars = &commands.FullHandler{
+	Func: wrapCommand(fnResetAvatars),
+	Name: "reset-avatars",
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionAdmin,
+		Description: "Reset cached avatar info and re-sync contacts or groups (rate-limited).",
+		Args:        "<group/groups/contacts/contacts-with-avatars>",
+	},
+	RequiresLogin: true,
+}
+
+func fnResetAvatars(ce *WrappedCommandEvent) {
+	if len(ce.Args) == 0 {
+		ce.Reply("**Usage**: `$cmdprefix reset-avatars <group/groups/contacts/contacts-with-avatars>`")
+		return
+	}
+
+	target := strings.ToLower(ce.Args[0])
+	switch target {
+	case "group", "portal", "room":
+		if ce.Portal == nil {
+			ce.Reply("This is not a portal room.")
+			return
+		}
+		if remaining, ok := shouldRateLimitResetAvatars(string(ce.User.MXID)); ok {
+			ce.Reply("This command is rate limited. Try again in %s.", formatCooldown(remaining))
+			return
+		}
+		switch ce.Portal.Type {
+		case discordgo.ChannelTypeDM:
+			otherUserID := ce.Portal.OtherUserID
+			if otherUserID == "" {
+				meta, err := ce.User.Session.Channel(ce.Portal.Key.ChannelID)
+				if err != nil {
+					ce.Reply("Failed to get DM info from Discord: %v", err)
+					return
+				}
+				if len(meta.Recipients) == 0 {
+					ce.Reply("Failed to find DM recipient.")
+					return
+				}
+				otherUserID = meta.Recipients[0].ID
+				ce.Portal.OtherUserID = otherUserID
+				ce.Portal.Update()
+			}
+			if otherUserID == "" {
+				ce.Reply("Failed to find DM recipient.")
+				return
+			}
+			puppet := ce.Bridge.GetPuppetByID(otherUserID)
+			if puppet == nil {
+				ce.Reply("Contact not found.")
+				return
+			}
+			resetPuppetAvatar(puppet)
+			info, err := ce.User.Session.User(otherUserID)
+			if err != nil {
+				ce.Reply("Failed to get user info from Discord: %v", err)
+				return
+			}
+			puppet.UpdateInfo(ce.User, info, nil)
+			ce.Reply("Avatar reset complete.")
+		case discordgo.ChannelTypeGroupDM:
+			resetPortalAvatar(ce.Portal)
+			if ce.Portal.UpdateInfo(ce.User, nil) == nil {
+				ce.Reply("Failed to get channel info from Discord.")
+				return
+			}
+			ce.Reply("Avatar reset complete.")
+		default:
+			if ce.Portal.Guild != nil {
+				resetGuildAvatar(ce.Portal.Guild)
+				meta, _ := ce.User.Session.State.Guild(ce.Portal.Guild.ID)
+				if meta == nil {
+					meta, _ = ce.User.Session.Guild(ce.Portal.Guild.ID)
+				}
+				if meta == nil {
+					ce.Reply("Failed to get guild info from Discord.")
+					return
+				}
+				ce.Portal.Guild.UpdateInfo(ce.User, meta)
+				ce.Reply("Avatar reset complete.")
+			} else {
+				resetPortalAvatar(ce.Portal)
+				if ce.Portal.UpdateInfo(ce.User, nil) == nil {
+					ce.Reply("Failed to get channel info from Discord.")
+					return
+				}
+				ce.Reply("Avatar reset complete.")
+			}
+		}
+	case "groups":
+		if remaining, ok := shouldRateLimitResetAvatars(string(ce.User.MXID)); ok {
+			ce.Reply("This command is rate limited. Try again in %s.", formatCooldown(remaining))
+			return
+		}
+		guildResets := 0
+		groupDMResets := 0
+		for _, portal := range ce.User.GetPortals() {
+			switch portal.Type {
+			case database.UserPortalTypeGuild:
+				guild := ce.Bridge.GetGuildByID(portal.DiscordID, false)
+				if guild == nil {
+					continue
+				}
+				if resetGuildAvatar(guild) {
+					guildResets++
+				}
+				meta, _ := ce.User.Session.State.Guild(guild.ID)
+				if meta == nil {
+					meta, _ = ce.User.Session.Guild(guild.ID)
+				}
+				if meta != nil {
+					guild.UpdateInfo(ce.User, meta)
+				}
+			case database.UserPortalTypeDM:
+				meta, _ := ce.User.Session.State.Channel(portal.DiscordID)
+				if meta == nil {
+					meta, _ = ce.User.Session.Channel(portal.DiscordID)
+				}
+				if meta == nil || meta.Type != discordgo.ChannelTypeGroupDM {
+					continue
+				}
+				groupPortal := ce.User.GetPortalByID(meta.ID, meta.Type)
+				if groupPortal == nil {
+					continue
+				}
+				if resetPortalAvatar(groupPortal) {
+					groupDMResets++
+				}
+				groupPortal.UpdateInfo(ce.User, meta)
+			}
+		}
+		ce.Reply("Queued avatar resets for %d guilds and %d group DMs.", guildResets, groupDMResets)
+	case "contacts", "contacts-with-avatars":
+		if remaining, ok := shouldRateLimitResetAvatars(string(ce.User.MXID)); ok {
+			ce.Reply("This command is rate limited. Try again in %s.", formatCooldown(remaining))
+			return
+		}
+		withAvatarsOnly := target == "contacts-with-avatars"
+		contactIDs := make(map[string]struct{})
+		for userID := range ce.User.relationships {
+			contactIDs[userID] = struct{}{}
+		}
+		for _, portal := range ce.User.GetPortals() {
+			if portal.Type != database.UserPortalTypeDM {
+				continue
+			}
+			dmPortal := ce.User.GetPortalByID(portal.DiscordID, discordgo.ChannelTypeDM)
+			if dmPortal != nil && dmPortal.OtherUserID != "" {
+				contactIDs[dmPortal.OtherUserID] = struct{}{}
+				continue
+			}
+			meta, _ := ce.User.Session.State.Channel(portal.DiscordID)
+			if meta == nil {
+				meta, _ = ce.User.Session.Channel(portal.DiscordID)
+			}
+			if meta == nil || meta.Type != discordgo.ChannelTypeDM || len(meta.Recipients) == 0 {
+				continue
+			}
+			contactIDs[meta.Recipients[0].ID] = struct{}{}
+		}
+		resetCount := 0
+		for userID := range contactIDs {
+			if userID == "" {
+				continue
+			}
+			puppet := ce.Bridge.GetPuppetByID(userID)
+			if puppet == nil {
+				continue
+			}
+			if withAvatarsOnly && puppet.Avatar == "" && puppet.AvatarURL.IsEmpty() && !puppet.AvatarSet {
+				continue
+			}
+			if resetPuppetAvatar(puppet) {
+				resetCount++
+			}
+			info, err := ce.User.Session.User(userID)
+			if err != nil {
+				ce.ZLog.Warn().Err(err).Str("user_id", userID).Msg("Failed to fetch contact info for avatar reset")
+				continue
+			}
+			puppet.UpdateInfo(ce.User, info, nil)
+		}
+		ce.Reply("Reset avatars for %d contacts.", resetCount)
+	default:
+		ce.Reply("**Usage**: `$cmdprefix reset-avatars <group/groups/contacts/contacts-with-avatars>`")
+	}
+}
+
+func resetPortalAvatar(portal *Portal) bool {
+	if portal.Avatar == "" && portal.AvatarURL.IsEmpty() && !portal.AvatarSet {
+		return false
+	}
+	portal.Avatar = ""
+	portal.AvatarURL = id.ContentURI{}
+	portal.AvatarSet = false
+	portal.Update()
+	return true
+}
+
+func resetGuildAvatar(guild *Guild) bool {
+	if guild.Avatar == "" && guild.AvatarURL.IsEmpty() && !guild.AvatarSet {
+		return false
+	}
+	guild.Avatar = ""
+	guild.AvatarURL = id.ContentURI{}
+	guild.AvatarSet = false
+	guild.Update()
+	return true
+}
+
+func resetPuppetAvatar(puppet *Puppet) bool {
+	if puppet.Avatar == "" && puppet.AvatarURL.IsEmpty() && !puppet.AvatarSet {
+		return false
+	}
+	puppet.Avatar = ""
+	puppet.AvatarURL = id.ContentURI{}
+	puppet.AvatarSet = false
+	puppet.Update()
+	return true
+}
+
+func shouldRateLimitResetAvatars(key string) (time.Duration, bool) {
+	resetAvatarsLimiter.Lock()
+	defer resetAvatarsLimiter.Unlock()
+
+	now := time.Now()
+	bucket := resetAvatarsLimiter.buckets[key]
+	if bucket.last.IsZero() {
+		bucket.last = now
+		bucket.tokens = float64(resetAvatarsBurst)
+	}
+
+	elapsed := now.Sub(bucket.last).Seconds()
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	refillRate := 1.0 / resetAvatarsRefillInterval.Seconds()
+	maxTokens := float64(resetAvatarsBurst)
+	bucket.tokens = math.Min(maxTokens, bucket.tokens+elapsed*refillRate)
+	bucket.last = now
+
+	if bucket.tokens >= 1 {
+		bucket.tokens -= 1
+		resetAvatarsLimiter.buckets[key] = bucket
+		return 0, false
+	}
+
+	needed := 1 - bucket.tokens
+	remainingSeconds := needed / refillRate
+	if remainingSeconds < 0 {
+		remainingSeconds = 0
+	}
+	resetAvatarsLimiter.buckets[key] = bucket
+	return time.Duration(math.Ceil(remainingSeconds)) * time.Second, true
+}
+
+func formatCooldown(duration time.Duration) string {
+	if duration < 0 {
+		duration = 0
+	}
+	duration = duration.Round(time.Second)
+	hours := int(duration.Hours())
+	minutes := int(duration.Minutes()) % 60
+	seconds := int(duration.Seconds()) % 60
+	if hours > 0 {
+		return fmt.Sprintf("%dh%dm", hours, minutes)
+	} else if minutes > 0 {
+		return fmt.Sprintf("%dm%ds", minutes, seconds)
+	}
+	return fmt.Sprintf("%ds", seconds)
 }
 
 var cmdDeleteAllPortals = &commands.FullHandler{
