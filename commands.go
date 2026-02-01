@@ -930,17 +930,24 @@ func fnResetAvatars(ce *WrappedCommandEvent) {
 			ce.Reply("Avatar reset complete.")
 		case discordgo.ChannelTypeGroupDM:
 			resetPortalAvatar(ce.Portal)
-			if ce.Portal.UpdateInfo(ce.User, nil) == nil {
+			meta, err := ce.User.Session.Channel(ce.Portal.Key.ChannelID)
+			if err != nil {
+				ce.Reply("Failed to get channel info from Discord: %v", err)
+				return
+			}
+			if meta == nil {
 				ce.Reply("Failed to get channel info from Discord.")
 				return
 			}
+			ce.Portal.UpdateInfo(ce.User, meta)
 			ce.Reply("Avatar reset complete.")
 		default:
 			if ce.Portal.Guild != nil {
 				resetGuildAvatar(ce.Portal.Guild)
-				meta, _ := ce.User.Session.State.Guild(ce.Portal.Guild.ID)
-				if meta == nil {
-					meta, _ = ce.User.Session.Guild(ce.Portal.Guild.ID)
+				meta, err := ce.User.Session.Guild(ce.Portal.Guild.ID)
+				if err != nil {
+					ce.Reply("Failed to get guild info from Discord: %v", err)
+					return
 				}
 				if meta == nil {
 					ce.Reply("Failed to get guild info from Discord.")
@@ -974,18 +981,12 @@ func fnResetAvatars(ce *WrappedCommandEvent) {
 				if resetGuildAvatar(guild) {
 					guildResets++
 				}
-				meta, _ := ce.User.Session.State.Guild(guild.ID)
-				if meta == nil {
-					meta, _ = ce.User.Session.Guild(guild.ID)
-				}
+				meta, _ := ce.User.Session.Guild(guild.ID)
 				if meta != nil {
 					guild.UpdateInfo(ce.User, meta)
 				}
 			case database.UserPortalTypeDM:
-				meta, _ := ce.User.Session.State.Channel(portal.DiscordID)
-				if meta == nil {
-					meta, _ = ce.User.Session.Channel(portal.DiscordID)
-				}
+				meta, _ := ce.User.Session.Channel(portal.DiscordID)
 				if meta == nil || meta.Type != discordgo.ChannelTypeGroupDM {
 					continue
 				}
