@@ -1028,7 +1028,6 @@ func fnResetAvatars(ce *WrappedCommandEvent) {
 			ce.Reply("This command is rate limited. Try again in %s.", formatCooldown(remaining))
 			return
 		}
-		withAvatarsOnly := target == "contacts-with-avatars"
 		contactIDs := make(map[string]struct{})
 		for _, puppet := range ce.Bridge.GetAllPuppets() {
 			if puppet == nil || puppet.ID == "" {
@@ -1066,9 +1065,6 @@ func fnResetAvatars(ce *WrappedCommandEvent) {
 			if puppet == nil {
 				continue
 			}
-			if withAvatarsOnly && puppet.Avatar == "" && puppet.AvatarURL.IsEmpty() && !puppet.AvatarSet {
-				continue
-			}
 			if resetPuppetAvatar(puppet) {
 				resetCount++
 			}
@@ -1082,6 +1078,7 @@ func fnResetAvatars(ce *WrappedCommandEvent) {
 				if dmPortal == nil || dmPortal.MXID == "" {
 					continue
 				}
+				resetPortalAvatar(dmPortal)
 				if dmPortal.UpdateAvatarFromPuppet(puppet) {
 					dmPortal.Update()
 					dmPortal.UpdateBridgeInfo()
